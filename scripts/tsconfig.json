@@ -1,0 +1,23 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "outDir": "./ignored",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitReturns": true,
+    "noImplicitOverride": false,
+    "noFallthroughCasesInSwitch": true,
+    "incremental": true,
+    "allowJs": false,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "useUnknownInCatchVariables": false
+  },
+  "include": ["./**/*.ts", "./**/*.js", "./**/*.mjs"]
+}
