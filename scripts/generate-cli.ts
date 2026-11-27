@@ -1,0 +1,212 @@
+/**
+ * @license
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+import {categoryToFlagName} from '../out/Default/gen/src/config/category-options.js';
+import {ServerConfig} from '../out/Default/gen/src/config/ServerConfig.js';
+import {zod} from '../out/Default/gen/src/third_party/index.js';
+import {labels, ToolCategory} from '../out/Default/gen/src/tools/categories.js';
+import {isSlimTool} from '../out/Default/gen/src/tools/ToolDefinition.js';
+import {
+  createTools,
+  requiresHiddenFlag,
+} from '../out/Default/gen/src/tools/tools.js';
+
+const OUTPUT_PATH = path.join(
+  import.meta.dirname,
+  '../src/config/cli-options.ts',
+);
+
+/**
+ * Optional args that intentionally remain positional for backwards-compatible
+ * CLI syntax. Every required arg is positional; every other optional arg is a
+ * flag.
+ */
+const OPTIONAL_POSITIONAL_ARGS = new Set(['evaluate_script:function']);
+
+interface CliOption {
+  name: string;
+  type: string;
+  description: string;
+  required: boolean;
+  positional: boolean;
+  minItems?: number;
+  default?: unknown;
+  enum?: unknown[];
+}
+
+interface JsonSchema {
+  type?: string | string[];
+  description?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  minItems?: number;
+  default?: unknown;
+  enum?: unknown[];
+}
+
+function schemaToCLIOptions(toolName: string, schema: JsonSchema): CliOption[] {
+  if (!schema || !schema.properties) {
+    return [];
+  }
+  const required = schema.required || [];
+  const properties = schema.properties;
+  return Object.entries(properties).map(([name, prop]) => {
+    const isRequired = required.includes(name);
+    const description = prop.description || '';
+    if (typeof prop.type !== 'string') {
+      throw new Error(
+        `Property ${name} has a complex type not supported by CLI.`,
+      );
+    }
+    return {
+      name,
+      type: prop.type,
+      description,
+      required: isRequired,
+      positional:
+        isRequired || OPTIONAL_POSITIONAL_ARGS.has(`${toolName}:${name}`),
+      minItems: prop.minItems,
+      default: prop.default,
+      enum: prop.enum,
+    };
+  });
+}
+
+async function generateCli() {
+  const cliDefaults = ServerConfig.applyDefaults(
+    {viaCli: true},
+    {suppressUsageStatisticsNotice: true},
+  );
+  const tools = createTools(cliDefaults);
+
+  // Sort tools by name
+  const sortedTools = tools
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .filter(tool => {
+      // Skipping slim tools and tools behind internal flags.
+      if (isSlimTool(tool) || requiresHiddenFlag(tool)) {
+        return false;
+      }
+      // Skipping fill_form because it is not relevant in shell scripts
+      // and CLI does not handle array/JSON args well.
+      if (tool.name === 'fill_form') {
+        return false;
+      }
+      // Skipping wait_for because CLI does not handle array/JSON args well
+      // and shell scripts have many mechanisms for waiting.
+      if (tool.name === 'wait_for') {
+        return false;
+      }
+      // Skipping get_tab_id as it is for internal integrations
+      if (tool.name === 'get_tab_id') {
+        return false;
+      }
+      // Skipping in_page tools as they are not launched yet
+      if (tool.annotations.category === ToolCategory.IN_PAGE) {
+        return false;
+      }
+      return true;
+    });
+
+  const commands: Record<
+    string,
+    {description: string; category: string; args: Record<string, CliOption>}
+  > = {};
+
+  for (const tool of sortedTools) {
+    const inputSchema = zod.toJSONSchema(zod.object(tool.schema), {
+      io: 'input',
+    }) as JsonSchema;
+    const options = schemaToCLIOptions(tool.name, inputSchema);
+    const args: Record<string, CliOption> = {};
+    for (const opt of options) {
+      args[opt.name] = opt;
+    }
+
+    const categoryEnum = tool.annotations.category;
+    if (!categoryEnum) {
+      throw new Error(`Tool ${tool.name} has no category.`);
+    }
+    const category = labels[categoryEnum as unknown as keyof typeof labels];
+    if (!tool.description) {
+      throw new Error(`Tool ${tool.name} is missing description`);
+    }
+
+    let description = tool.description;
+    const requiredFlags: string[] = [];
+
+    const categoryFlag = categoryToFlagName(categoryEnum);
+    if (!cliDefaults[categoryFlag]) {
+      requiredFlags.push(`--${categoryFlag}=true`);
+    }
+
+    const conditions = tool.annotations.conditions || [];
+    for (const condition of conditions) {
+      if (!cliDefaults[condition]) {
+        requiredFlags.push(`--${condition}=true`);
+      }
+    }
+
+    if (requiredFlags.length > 0) {
+      description += ` (requires flag: ${requiredFlags.join(', ')})`;
+    }
+
+    commands[tool.name] = {
+      description,
+      category,
+      args,
+    };
+  }
+
+  const lines: string[] = [];
+  lines.push(`/**
+ * @license
+ * Copyright ${new Date().getFullYear()} Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * @fileoverview
+ * WARNING: This file is auto-generated by 'npm run cli:generate'.
+ * Do not edit this file manually.
+ */
+
+
+export interface ArgDef {
+  name: string;
+  type: string;
+  description: string;
+  required: boolean;
+  /** Whether the arg is a positional on the command line, otherwise a flag. */
+  positional: boolean;
+  /** Minimum number of items for array args, from JSON Schema minItems. */
+  minItems?: number;
+  default?: string | number | boolean;
+  enum?: ReadonlyArray<string | number>;
+}
+export type Commands = Record<
+  string,
+  {
+    description: string;
+    category: string;
+    args: Record<string, ArgDef>
+  }
+>;
+export const commands: Commands = ${JSON.stringify(commands, null, 2)} as const;
+`);
+
+  fs.mkdirSync(path.dirname(OUTPUT_PATH), {recursive: true});
+  fs.writeFileSync(OUTPUT_PATH, lines.join(''));
+  console.log(`Generated CLI at ${OUTPUT_PATH}`);
+}
+
+generateCli().catch(err => {
+  console.error('Error during generation:', err);
+  process.exit(1);
+});
